@@ -129,6 +129,61 @@ typedef struct {
 	unsigned char *data;
 } libpng_write_t;
 
+static void test_rvv(const unsigned char* rgba, int w, int h, int c) {
+    int out_size = qoy_ycbcra_size(w, h, c);
+    unsigned char *c_ref = malloc(out_size);
+    unsigned char *c_rvv = malloc(out_size);
+
+    // 使用原始 C 版進行轉換
+    qoy_rgba_to_ycbcra(rgba, w, h, c, c, c_ref);
+    // 使用 RVV 優化版進行轉換
+    qoy_rgba_to_ycbcra_rvv(rgba, w, h, c, c, c_rvv);
+
+    printf("Checking RVV implementation against C implementation...\n");
+    int diff = memcmp(c_ref, c_rvv, out_size);
+    if (diff == 0) {
+        printf("RVV and C outputs match perfectly.\n");
+    } else {
+        printf("RVV and C outputs differ. Detailed comparison below:\n");
+
+        // 分塊比較數據，假設每塊的大小固定
+        int block_size = (c == 4) ? 10 : 6; // 每個塊的輸出大小
+        int num_blocks = out_size / block_size;
+
+        for (int block = 0; block < num_blocks; block++) {
+            printf("Block Index: %d\n", block);
+            printf("--------------------------------------------------------\n");
+
+            printf("| Ref Output | ");
+            for (int i = 0; i < block_size; i++) {
+                printf("0x%02X ", c_ref[block * block_size + i]);
+            }
+            printf("|\n");
+
+            printf("| RVV Output | ");
+            for (int i = 0; i < block_size; i++) {
+                printf("0x%02X ", c_rvv[block * block_size + i]);
+            }
+            printf("|\n");
+
+            printf("--------------------------------------------------------\n");
+            printf("Differences:\n");
+            for (int i = 0; i < block_size; i++) {
+                if (c_ref[block * block_size + i] != c_rvv[block * block_size + i]) {
+                    printf("  Byte %d: Ref=0x%02X, RVV=0x%02X\n",
+                           i, c_ref[block * block_size + i], c_rvv[block * block_size + i]);
+                }
+            }
+            printf("\n");
+        }
+    }
+
+    // 清理內存
+    free(c_ref);
+    free(c_rvv);
+}
+
+
 void libpng_encode_callback(png_structp png_ptr, png_bytep data, png_size_t length) {
 	libpng_write_t *write_data = (libpng_write_t*)png_get_io_ptr(png_ptr);
 	if (write_data->size + length >= write_data->capacity) {
@@ -456,6 +511,7 @@ benchmark_result_t benchmark_image(const char *path) {
 	}
 
 	void *pixels = (void *)stbi_load(path, &w, &h, NULL, channels);
+	test_rvv((unsigned char*)pixels, w,h, channels);
 	void *encoded_png = fload(path, &encoded_png_size);
 	void *encoded_qoi = qoi_encode(pixels, &(qoi_desc){
 			.width = w,

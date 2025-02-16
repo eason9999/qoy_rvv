@@ -571,6 +571,20 @@ Returns the number of bytes written. */
 int qoy_rgba_to_ycbcra(const void* rgba_in, int width, int height, int channels_in, int channels_out, void *ycbcr420a_out);
 
 
+/* 
+  RVV 版函式之宣告
+  說明：若 channels_in=4 => RGBA，=3 => RGB
+       channels_out=4 => 生成 YCbCrA，=3 => 無 alpha
+*/
+int qoy_rgba_to_ycbcra_rvv(
+    const void* rgba_in,
+    int width,
+    int height,
+    int channels_in,
+    int channels_out,
+    void *ycbcr420a_out
+);
+
 /* Convert buffer from YCbCrA to RGBA colorspace.
 
 Both channels_in and channels_out must 3 (no alpha) or 4 (alpha), but need not
@@ -597,6 +611,7 @@ Implementation */
 #ifdef QOY_IMPLEMENTATION
 #include <stdlib.h>
 #include <string.h>
+#include <riscv_vector.h>
 
 #ifndef QOY_MALLOC
     #define QOY_MALLOC(sz) malloc(sz)
@@ -696,15 +711,23 @@ static inline int qoy_rgba_to_ycbcra_two_lines(const void* rgba_in, int width, i
         qoy_rgba_t *p3 = (qoy_rgba_t *)(((width & 0x01) == 1 && i == width - 1) ? line1 : line1 + channels_in);
         qoy_rgba_t *p4 = (qoy_rgba_t *)(((width & 0x01) == 1 && i == width - 1) ? line2 : line2 + channels_in);
         qoy_ycbcr420a_t *pout = (qoy_ycbcr420a_t *)out;
+        
+
         pout->y[0] = ((1254097 * p1->r) + (2462056 * p1->g) + (478151 * p1->b)) >> 22;
         pout->y[1] = ((1254097 * p2->r) + (2462056 * p2->g) + (478151 * p2->b)) >> 22;
         pout->y[2] = ((1254097 * p3->r) + (2462056 * p3->g) + (478151 * p3->b)) >> 22;
         pout->y[3] = ((1254097 * p4->r) + (2462056 * p4->g) + (478151 * p4->b)) >> 22;
+        
+        
+           
         unsigned int r4 = p1->r + p2->r + p3->r + p4->r;
         unsigned int g4 = p1->g + p2->g + p3->g + p4->g;
         unsigned int b4 = p1->b + p2->b + p3->b + p4->b;
         pout->cb = qoy_8bit_clamp((134217728 - (44233 * r4) - (86839 * g4) + (b4 << 17) + (1 << 19)) >> 20);
         pout->cr = qoy_8bit_clamp((134217728 + (r4 << 17) - (109757 * g4) - (21315 * b4) + (1 << 19)) >> 20);
+        
+        
+        
         if (channels_out == 4) {
             if (channels_in == 4) {
                 pout->a[0] = p1->a;
@@ -720,6 +743,236 @@ static inline int qoy_rgba_to_ycbcra_two_lines(const void* rgba_in, int width, i
         }
         written += size_out;
     }
+    return written;
+}
+
+static inline uint8_t __clamp_u8_rvv(int x){
+    if (x<0) x=0;
+    else if (x>255) x=255;
+    return (uint8_t)x;
+}
+
+int qoy_rgba_to_ycbcra_rvv( 
+    const void* rgba_in,
+    int width,
+    int height,
+    int channels_in,
+    int channels_out,
+    void *ycbcr420a_out
+){
+    // (1) channels_in != 4 => 3
+    //     channels_out !=4 => 3
+    if (channels_in != 4) channels_in = 3;
+    if (channels_out != 4) channels_out = 3;
+
+    const uint8_t* src = (const uint8_t*)rgba_in;
+    uint8_t* dst       = (uint8_t*)ycbcr420a_out;
+    int block_size = (channels_out == 4) ? 10 : 6;
+    int written = 0;
+
+    for(int y = 0; y < height; y += 2){
+        int lineCount = 2;
+        if((y == height - 1) && (height & 1)) lineCount = 1; // odd height => 最後一行
+
+        // 分配 buffer:
+        uint8_t* R1= (uint8_t*)malloc(width);
+        uint8_t* G1= (uint8_t*)malloc(width);
+        uint8_t* B1= (uint8_t*)malloc(width);
+        uint8_t* A1= (uint8_t*)malloc(width);
+        uint8_t* R2= (uint8_t*)malloc(width);
+        uint8_t* G2= (uint8_t*)malloc(width);
+        uint8_t* B2= (uint8_t*)malloc(width);
+        uint8_t* A2= (uint8_t*)malloc(width);
+
+        const uint8_t* line1= src + (y * width * channels_in);
+        const uint8_t* line2= (lineCount == 2) ? (line1 + width * channels_in) : line1;
+
+        // ----------(A) 分離通道-----------
+        for(int x = 0; x < width; x++){
+            const uint8_t* p1 = line1 + x * channels_in;
+            R1[x] = p1[0];
+            G1[x] = p1[1];
+            B1[x] = p1[2];
+            A1[x] = (channels_in == 4) ? p1[3] : 0xff;
+            if(lineCount == 2){
+                const uint8_t* p2 = line2 + x * channels_in;
+                R2[x] = p2[0];
+                G2[x] = p2[1];
+                B2[x] = p2[2];
+                A2[x] = (channels_in == 4) ? p2[3] : 0xff;
+            }
+            else{
+                // lines=1 => same as line1
+                R2[x] = R1[x];
+                G2[x] = G1[x];
+                B2[x] = B1[x];
+                A2[x] = A1[x];
+            }
+        }
+
+        // ----------(B) RVV 計算 Y-----------
+        uint8_t* Y1= (uint8_t*)malloc(width);
+        uint8_t* Y2= (uint8_t*)malloc(width);
+
+        int idx = 0;
+        while(idx < width){
+            size_t vl = __riscv_vsetvl_e8m1(width - idx); 
+            // load R1
+            vuint8m1_t vr_in = __riscv_vle8_v_u8m1(&R1[idx], vl);
+            vuint8m1_t vg_in = __riscv_vle8_v_u8m1(&G1[idx], vl);
+            vuint8m1_t vb_in = __riscv_vle8_v_u8m1(&B1[idx], vl);
+
+            // zero-extend => i32
+            // 第一步：8 位無符號整數擴展到 16 位
+            vuint16m2_t vr_temp = __riscv_vwcvtu_x_x_v_u16m2(vr_in, vl);
+            vuint16m2_t vg_temp = __riscv_vwcvtu_x_x_v_u16m2(vg_in, vl);
+            vuint16m2_t vb_temp = __riscv_vwcvtu_x_x_v_u16m2(vb_in, vl);
+
+            // 第二步：16 位無符號整數擴展到 32 位
+            vuint32m4_t vr = __riscv_vwcvtu_x_x_v_u32m4(vr_temp, vl);
+            vuint32m4_t vg = __riscv_vwcvtu_x_x_v_u32m4(vg_temp, vl);
+            vuint32m4_t vb = __riscv_vwcvtu_x_x_v_u32m4(vb_temp, vl);
+
+            // multiply => c_r= vr*1254097
+            vuint32m4_t c_r = __riscv_vmul_vx_u32m4(vr, 1254097, vl);
+            vuint32m4_t c_g = __riscv_vmul_vx_u32m4(vg, 2462056, vl);
+            vuint32m4_t c_b = __riscv_vmul_vx_u32m4(vb, 478151,  vl);
+
+            // ysum = c_r+c_g+c_b => vsra >>22 => clamp
+            vuint32m4_t ysum = __riscv_vadd_vv_u32m4(c_r, c_g, vl);
+            ysum = __riscv_vadd_vv_u32m4(ysum, c_b, vl);
+            ysum = __riscv_vsrl_vx_u32m4(ysum, 22, vl); // >>22
+            // clamp 0..255
+            ysum = __riscv_vmaxu_vx_u32m4(ysum, 0, vl);
+            ysum = __riscv_vminu_vx_u32m4(ysum, 255, vl);
+            // cast to u8 => vnclipu_wx
+            // 第一步：從 vuint32m4_t 窄化到 vuint16m2_t
+            vuint16m2_t ysum_16 = __riscv_vnclipu_wx_u16m2(ysum, 0, 0, vl);
+
+            // 第二步：從 vuint16m2_t 窄化到 vuint8m1_t	
+            vuint8m1_t vy = __riscv_vnclipu_wx_u8m1(ysum_16, 0, 0, vl);
+
+            // store => Y1
+            __riscv_vse8_v_u8m1(&Y1[idx], vy, vl);
+
+            // line2
+            if(lineCount == 2){
+                vuint8m1_t vr2_in = __riscv_vle8_v_u8m1(&R2[idx], vl);
+                vuint8m1_t vg2_in = __riscv_vle8_v_u8m1(&G2[idx], vl);
+                vuint8m1_t vb2_in = __riscv_vle8_v_u8m1(&B2[idx], vl);
+                // zero-extend => i32
+                // 第一步：8 位無符號整數擴展到 16 位
+                vuint16m2_t vr2_temp = __riscv_vwcvtu_x_x_v_u16m2(vr2_in, vl);
+                vuint16m2_t vg2_temp = __riscv_vwcvtu_x_x_v_u16m2(vg2_in, vl);
+                vuint16m2_t vb2_temp = __riscv_vwcvtu_x_x_v_u16m2(vb2_in, vl);
+
+                // 第二步：16 位無符號整數擴展到 32 位
+                vuint32m4_t vr2 = __riscv_vwcvtu_x_x_v_u32m4(vr2_temp, vl);
+                vuint32m4_t vg2 = __riscv_vwcvtu_x_x_v_u32m4(vg2_temp, vl);
+                vuint32m4_t vb2 = __riscv_vwcvtu_x_x_v_u32m4(vb2_temp, vl);
+                
+                vuint32m4_t c_r2 = __riscv_vmul_vx_u32m4(vr2, 1254097, vl);
+                vuint32m4_t c_g2 = __riscv_vmul_vx_u32m4(vg2, 2462056, vl);
+                vuint32m4_t c_b2 = __riscv_vmul_vx_u32m4(vb2, 478151,  vl);
+
+                vuint32m4_t ysum2 = __riscv_vadd_vv_u32m4(c_r2, c_g2, vl);
+                ysum2 = __riscv_vadd_vv_u32m4(ysum2, c_b2, vl);
+                ysum2 = __riscv_vsrl_vx_u32m4(ysum2, 22, vl);
+                ysum2 = __riscv_vmaxu_vx_u32m4(ysum2, 0, vl);
+                ysum2 = __riscv_vminu_vx_u32m4(ysum2, 255, vl);
+                // cast to u8 => vnclipu_wx
+                // 第一步：從 vuint32m4_t 窄化到 vuint16m2_t
+                vuint16m2_t ysum2_16 = __riscv_vnclipu_wx_u16m2(ysum2, 0, 0, vl);
+
+                // 第二步：從 vuint16m2_t 窄化到 vuint8m1_t
+                vuint8m1_t vy2 = __riscv_vnclipu_wx_u8m1(ysum2_16, 0, 0, vl);
+
+                __riscv_vse8_v_u8m1(&Y2[idx], vy2, vl);
+            }
+            else{
+                // lines=1 => same as Y1
+                __riscv_vse8_v_u8m1(&Y2[idx], vy, vl);
+            }
+
+            idx += vl;
+
+        }
+
+        // ----------(C) 完全依照純C版：2×2 Block 拼裝 Y / Cb / Cr / A-----------
+        // 純 C 是每次 i += 2 => 取 p1, p2, p3, p4
+        // 其中 p3, p4 若 width 為奇數且 i==width-1 => 重複 p1/p2
+        for(int i = 0; i < width; i += 2){
+            int i_next = i + 1;
+            if( (width & 1) == 1 && i == width - 1 ) {
+                // 若寬為奇數, 且已到最後一個像素 => 重複它自己
+                i_next = i; 
+            }
+
+            // 對應 R/G/B/A
+            // p1 => top-left
+            int r1 = R1[i], g1 = G1[i], b1 = B1[i], a1 = A1[i];
+            // p2 => bottom-left
+            int r2 = R2[i], g2 = G2[i], b2 = B2[i], a2 = A2[i];
+            // p3 => top-right
+            int r3 = R1[i_next], g3 = G1[i_next], b3 = B1[i_next], a3 = A1[i_next];
+            // p4 => bottom-right
+            int r4 = R2[i_next], g4 = G2[i_next], b4 = B2[i_next], a4 = A2[i_next];
+
+            // Y => 同純C的順序
+            // y[0] => p1, y[1] => p2, y[2] => p3, y[3] => p4
+            uint8_t y0 = Y1[i];
+            uint8_t y1 = Y2[i];
+            uint8_t y2 = Y1[i_next];
+            uint8_t y3 = Y2[i_next];
+
+            // 累加 r4Sum = p1.r + p2.r + p3.r + p4.r
+            int sum_r = r1 + r2 + r3 + r4;
+            int sum_g = g1 + g2 + g3 + g4;
+            int sum_b = b1 + b2 + b3 + b4;
+
+            // 與純 C 同一行寫法 => 避免 ±1
+            // cb = ( 134217728 - 44233*r4 - 86839*g4 + (b4<<17) + (1<<19) ) >> 20;
+            {
+                int cb = (int)((134217728 - (44233*sum_r) - (86839*sum_g) + (sum_b<<17) + (1<<19)) >> 20);
+		cb = (cb<0)?0 : (cb>255?255:cb);
+
+
+                // cr = ( 134217728 + (r4<<17) - 109757*g4 - 21315*b4 + (1<<19)) >>20;
+                int cr = (int)((134217728 + (sum_r << 17) - (109757 * sum_g) - (21315  * sum_b) + (1 << 19)) >> 20);
+		cr = (cr<0)?0 : (cr>255?255:cr);
+
+                // 寫進輸出
+                qoy_ycbcr420a_t *pout = (qoy_ycbcr420a_t *)(dst);
+
+                // 設定 Y
+                pout->y[0] = y0;
+                pout->y[1] = y1;
+                pout->y[2] = y2;
+                pout->y[3] = y3;
+
+                // 設定 Cb/Cr
+                pout->cb = (uint8_t)cb;
+                pout->cr = (uint8_t)cr;
+
+                // 若要輸出 Alpha 通道
+                if(channels_out == 4){
+                    pout->a[0] = (uint8_t)a1;
+                    pout->a[1] = (uint8_t)a2;
+                    pout->a[2] = (uint8_t)a3;
+                    pout->a[3] = (uint8_t)a4;
+                }
+            }
+
+            dst += block_size;
+            written += block_size;
+        } // end for i
+
+        // 釋放
+        free(R1);free(G1);free(B1);free(A1);
+        free(R2);free(G2);free(B2);free(A2);
+        free(Y1);free(Y2);
+    } // end for y
+
     return written;
 }
 
